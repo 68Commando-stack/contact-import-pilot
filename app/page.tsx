@@ -2,8 +2,8 @@
 
 import { useState, useRef, useEffect, KeyboardEvent } from 'react'
 import Image from 'next/image'
-import { unzip } from 'fflate'
 import { ImportedContact } from '@/lib/types'
+import { extractConnectionsCSV } from '@/lib/extract-linkedin-zip'
 
 interface TargetCompany {
   name: string
@@ -11,35 +11,6 @@ interface TargetCompany {
   logo: string | null
 }
 
-// ── ZIP extraction ─────────────────────────────────────────────────────────
-async function extractConnectionsCSV(zipFile: File): Promise<string> {
-  const buffer = await zipFile.arrayBuffer()
-  const uint8 = new Uint8Array(buffer)
-
-  return new Promise((resolve, reject) => {
-    unzip(uint8, (err, files) => {
-      if (err) {
-        reject(new Error('Could not read the ZIP file. Try downloading it again from LinkedIn.'))
-        return
-      }
-      // LinkedIn sometimes nests files in a subfolder — match by filename only
-      const key = Object.keys(files).find(
-        (k) => k.split('/').pop()?.toLowerCase() === 'connections.csv'
-      )
-      if (!key) {
-        reject(
-          new Error(
-            'Connections.csv not found in this ZIP. Make sure you selected "Connections" when requesting your LinkedIn data.'
-          )
-        )
-        return
-      }
-      resolve(new TextDecoder('utf-8').decode(files[key]))
-    })
-  })
-}
-
-// ── Matching ───────────────────────────────────────────────────────────────
 function matchesTarget(contact: ImportedContact, target: TargetCompany): boolean {
   const nameMatch = contact.company
     ? contact.company.toLowerCase().includes(target.name.toLowerCase())
@@ -60,7 +31,6 @@ function findMatchingTarget(
 
 type ViewMode = 'all' | 'matches'
 
-// ── Small components ───────────────────────────────────────────────────────
 function StepBadge({ n, done }: { n: number; done: boolean }) {
   return (
     <span
@@ -95,9 +65,78 @@ function CompanyLogo({ logo, name }: { logo: string | null; name: string }) {
   )
 }
 
-// ── Main page ──────────────────────────────────────────────────────────────
+function LinkedInSteps() {
+  return (
+    <div className="mb-4 bg-slate-50 border border-slate-200 rounded-lg p-4">
+      <p className="text-[12px] font-semibold text-slate-500 uppercase tracking-wide mb-3">
+        How to get your LinkedIn data
+      </p>
+      <ol className="space-y-3">
+        {[
+          {
+            step: '1',
+            text: "Open LinkedIn's data export page",
+            action: (
+              <a
+                href="https://www.linkedin.com/mypreferences/d/download-my-data"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-[12px] font-semibold text-orange-600 hover:text-orange-800 underline underline-offset-2"
+              >
+                Open LinkedIn →
+              </a>
+            ),
+          },
+          {
+            step: '2',
+            text: 'Select "Connections" only, then click Request archive',
+          },
+          {
+            step: '3',
+            text: 'Wait for the email from LinkedIn — usually 10–30 minutes',
+            note: 'You can close this tab and come back when the email arrives.',
+          },
+          {
+            step: '4',
+            text: 'Click the download link in the email to get your ZIP file',
+          },
+          {
+            step: '5',
+            text: 'Upload the ZIP file below — no need to unzip it',
+          },
+        ].map(({ step, text, action, note }) => (
+          <li key={step} className="flex gap-3">
+            <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-slate-200 text-[11px] font-bold text-slate-600 shrink-0 mt-0.5">
+              {step}
+            </span>
+            <div>
+              <span className="text-[13px] text-slate-700">{text}</span>
+              {action && <span className="ml-2">{action}</span>}
+              {note && (
+                <p className="text-[12px] text-slate-400 mt-0.5">{note}</p>
+              )}
+            </div>
+          </li>
+        ))}
+      </ol>
+
+      {/* Privacy note */}
+      <div className="mt-4 flex gap-2 bg-white border border-slate-200 rounded p-3">
+        <span className="text-[14px] shrink-0">🔒</span>
+        <p className="text-[12px] text-slate-500 leading-relaxed">
+          <span className="font-semibold text-slate-700">Your data stays on your device.</span>{' '}
+          The ZIP is unpacked entirely in your browser. We only read{' '}
+          <span className="font-mono text-slate-600">Connections.csv</span> — every
+          other file in the export (messages, profile, activity) is ignored and
+          never uploaded.
+        </p>
+      </div>
+    </div>
+  )
+}
+
 export default function Home() {
-  // Step 1 — target companies
+  // ── Step 1: target companies via Clearbit ──────────────────────────────────
   const [targetCompanies, setTargetCompanies] = useState<TargetCompany[]>([])
   const [companyInput, setCompanyInput] = useState('')
   const [suggestions, setSuggestions] = useState<TargetCompany[]>([])
@@ -105,21 +144,20 @@ export default function Home() {
   const [activeSuggestion, setActiveSuggestion] = useState(-1)
   const [showSuggestions, setShowSuggestions] = useState(false)
 
-  // Step 2 — LinkedIn import
+  // ── Step 2: LinkedIn import ────────────────────────────────────────────────
   const [contacts, setContacts] = useState<ImportedContact[]>([])
   const [source, setSource] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
-  const [uploadStep, setUploadStep] = useState<'idle' | 'extracting' | 'parsing'>('idle')
 
-  // Step 3 — view
+  // ── Step 3: view ───────────────────────────────────────────────────────────
   const [viewMode, setViewMode] = useState<ViewMode>('matches')
 
   const fileRef = useRef<HTMLInputElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
-  // Clearbit autocomplete
+  // Clearbit autocomplete with debounce
   useEffect(() => {
     const q = companyInput.trim()
     if (!q) {
@@ -150,6 +188,7 @@ export default function Home() {
   async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file) return
+
     setUploading(true)
     setUploadError(null)
 
@@ -157,14 +196,13 @@ export default function Home() {
       let csvText: string
 
       if (file.name.toLowerCase().endsWith('.zip')) {
-        setUploadStep('extracting')
+        // Extract Connections.csv from the ZIP in the browser
         csvText = await extractConnectionsCSV(file)
       } else {
-        setUploadStep('parsing')
+        // Plain CSV upload
         csvText = await file.text()
       }
 
-      setUploadStep('parsing')
       const res = await fetch('/api/contacts/linkedin', {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
@@ -178,7 +216,6 @@ export default function Home() {
       setUploadError(err instanceof Error ? err.message : 'Unknown error')
     } finally {
       setUploading(false)
-      setUploadStep('idle')
       if (fileRef.current) fileRef.current.value = ''
     }
   }
@@ -238,12 +275,6 @@ export default function Home() {
   const step2Done = contacts.length > 0
   const step3Active = step1Done && step2Done
 
-  const uploadLabel = uploading
-    ? uploadStep === 'extracting'
-      ? 'Extracting Connections.csv…'
-      : 'Parsing contacts…'
-    : 'Upload LinkedIn export'
-
   return (
     <main className="min-h-screen bg-slate-100 font-sans">
       <header className="bg-slate-900 h-14 flex items-center px-6">
@@ -255,7 +286,7 @@ export default function Home() {
       <div className="max-w-4xl mx-auto px-6 py-10">
         <h1 className="text-[22px] font-bold text-slate-900 mb-1">Import Contacts</h1>
         <p className="text-[13px] text-slate-500 mb-8">
-          Choose your target companies, import your LinkedIn contacts, and see who you know there.
+          Choose your target companies, import your LinkedIn connections, and see who you know there.
         </p>
 
         {/* ── Step 1 — Target companies ── */}
@@ -271,8 +302,7 @@ export default function Home() {
             </span>
           </div>
           <p className="text-[13px] text-slate-500 mb-3 ml-8">
-            Search any company by name — powered by Clearbit&apos;s company database. Add as many
-            as you like.
+            Search any company by name — powered by Clearbit&apos;s company database. Add as many as you like.
           </p>
 
           <div className="ml-8">
@@ -293,6 +323,7 @@ export default function Home() {
                   placeholder="Search companies — e.g. McKinsey, Google, JPMorgan…"
                   className="w-full border border-slate-200 rounded px-3 py-2 text-[13px] text-slate-900 placeholder:text-slate-300 focus:outline-none focus:border-slate-400"
                 />
+
                 {showSuggestions && companyInput.trim() && (
                   <ul className="absolute z-20 left-0 right-0 top-full mt-1 bg-white border border-slate-200 rounded shadow-lg max-h-64 overflow-y-auto">
                     {suggestionsLoading && suggestions.length === 0 && (
@@ -362,11 +393,13 @@ export default function Home() {
           </div>
         </div>
 
-        {/* ── Step 2 — LinkedIn import ── */}
+        {/* ── Step 2 — Import LinkedIn ── */}
         <div
           className={`bg-white rounded-lg border p-5 mb-4 transition-opacity ${
-            step1Done ? 'opacity-100' : 'opacity-40 pointer-events-none'
-          } ${step2Done ? 'border-orange-300' : 'border-slate-200'}`}
+            step1Done
+              ? `opacity-100 ${step2Done ? 'border-orange-300' : 'border-slate-200'}`
+              : 'border-slate-200 opacity-40 pointer-events-none'
+          }`}
         >
           <div className="flex items-center mb-1">
             <StepBadge n={2} done={step2Done} />
@@ -376,7 +409,7 @@ export default function Home() {
           </div>
 
           {step2Done ? (
-            /* ── Already uploaded ── */
+            /* ── Success state ── */
             <div className="ml-8 mt-3 flex items-center justify-between">
               <span className="text-[13px] text-slate-500">
                 <span className="font-semibold text-slate-900">{contacts.length} contacts</span>{' '}
@@ -395,87 +428,24 @@ export default function Home() {
               </label>
             </div>
           ) : (
-            /* ── Instructions + upload ── */
+            /* ── Upload state ── */
             <div className="ml-8 mt-3">
+              <LinkedInSteps />
 
-              {/* Step-by-step guide */}
-              <div className="bg-slate-50 border border-slate-200 rounded-lg p-4 mb-4">
-                <p className="text-[12px] font-semibold text-slate-500 uppercase tracking-wide mb-3">
-                  How to get your LinkedIn connections file
-                </p>
-                <ol className="space-y-3">
-                  {[
-                    {
-                      n: 1,
-                      text: 'Open LinkedIn's data export page',
-                      action: (
-                        <a
-                          href="https://www.linkedin.com/mypreferences/d/download-my-data"
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 text-[12px] font-semibold text-orange-600 hover:text-orange-700 underline underline-offset-2"
-                        >
-                          Open LinkedIn →
-                        </a>
-                      ),
-                    },
-                    {
-                      n: 2,
-                      text: 'Select “Connections” only, then click “Request archive”',
-                    },
-                    {
-                      n: 3,
-                      text: 'Check your email — LinkedIn will send a download link (usually 10–30 minutes)',
-                    },
-                    {
-                      n: 4,
-                      text: 'Click the link in the email to download your ZIP file, then upload it below',
-                    },
-                  ].map(({ n, text, action }) => (
-                    <li key={n} className="flex items-start gap-3">
-                      <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-slate-200 text-[10px] font-bold text-slate-500 shrink-0 mt-0.5">
-                        {n}
-                      </span>
-                      <span className="text-[13px] text-slate-600 flex-1">
-                        {text}
-                        {action && <span className="ml-2">{action}</span>}
-                      </span>
-                    </li>
-                  ))}
-                </ol>
-              </div>
-
-              {/* Privacy note */}
-              <div className="flex items-start gap-2 bg-blue-50 border border-blue-100 rounded-lg px-4 py-3 mb-4">
-                <span className="text-blue-400 text-[15px] shrink-0 mt-0.5">🔒</span>
-                <p className="text-[12px] text-blue-700 leading-relaxed">
-                  <span className="font-semibold">Your data stays private.</span> The ZIP file is
-                  processed entirely in your browser — only your connections list is read. No other
-                  LinkedIn data is accessed, and nothing is stored on our servers.
-                </p>
-              </div>
-
-              {/* Upload error */}
               {uploadError && (
                 <div className="bg-red-50 border border-red-200 text-red-700 text-[13px] px-4 py-3 rounded mb-4">
                   {uploadError}
                 </div>
               )}
 
-              {/* Upload button */}
-              <label className="inline-flex items-center gap-2 cursor-pointer bg-slate-900 text-white text-[12px] font-semibold px-4 py-2.5 rounded hover:bg-slate-700 transition-colors">
+              <label className="inline-block cursor-pointer bg-slate-900 text-white text-[12px] font-semibold px-4 py-2 rounded hover:bg-slate-700 transition-colors">
                 {uploading ? (
-                  <>
-                    <span className="animate-spin inline-block w-3 h-3 border-2 border-white/30 border-t-white rounded-full" />
-                    {uploadLabel}
-                  </>
+                  <span className="flex items-center gap-2">
+                    <span className="animate-spin inline-block w-3 h-3 border-2 border-white/40 border-t-white rounded-full" />
+                    {uploading ? 'Processing…' : ''}
+                  </span>
                 ) : (
-                  <>
-                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 16 16" stroke="currentColor" strokeWidth={2}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M8 2v8m0-8L5 5m3-3l3 3M2 11v1.5A1.5 1.5 0 003.5 14h9A1.5 1.5 0 0014 12.5V11" />
-                    </svg>
-                    Upload LinkedIn export
-                  </>
+                  'Upload ZIP or CSV'
                 )}
                 <input
                   ref={fileRef}
@@ -486,10 +456,9 @@ export default function Home() {
                   disabled={uploading}
                 />
               </label>
-              <p className="text-[11px] text-slate-400 mt-2">
-                Accepts the LinkedIn export <span className="font-mono">.zip</span> or{' '}
-                <span className="font-mono">Connections.csv</span> directly
-              </p>
+              <span className="ml-3 text-[12px] text-slate-400">
+                Accepts the LinkedIn export ZIP or a plain Connections.csv
+              </span>
             </div>
           )}
         </div>
@@ -516,7 +485,11 @@ export default function Home() {
                     value: new Set(contacts.map((c) => c.company).filter(Boolean)).size,
                   },
                   { label: 'Target companies', value: targetCompanies.length },
-                  { label: 'Contacts at targets', value: matchedContacts.length, highlight: true },
+                  {
+                    label: 'Contacts at targets',
+                    value: matchedContacts.length,
+                    highlight: true,
+                  },
                 ].map(({ label, value, highlight }) => (
                   <div
                     key={label}
@@ -640,7 +613,7 @@ export default function Home() {
                 {displayedContacts.length === 0 && (
                   <div className="px-4 py-8 text-[13px] text-slate-400 text-center">
                     {viewMode === 'matches'
-                      ? 'No contacts found at your target companies. Try adding more or check spelling.'
+                      ? 'No contacts found at your target companies. Try adding more companies or check spelling.'
                       : 'No contacts loaded.'}
                   </div>
                 )}
